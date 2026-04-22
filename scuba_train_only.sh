@@ -43,7 +43,10 @@ tok = AutoTokenizer.from_pretrained(STUDENT_PATH, use_fast=True)
 tok.pad_token = tok.eos_token
 tok.padding_side = "right"
 
-print("[DISTILL] Loading teacher NF4...")
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+print("[DISTILL] Loading teacher NF4 on GPUs 0-1...")
 bnb = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
@@ -52,18 +55,18 @@ bnb = BitsAndBytesConfig(
 )
 teacher = AutoModelForCausalLM.from_pretrained(
     TEACHER_PATH, quantization_config=bnb,
-    device_map="auto", torch_dtype=torch.bfloat16,
+    device_map={"": 0}, torch_dtype=torch.bfloat16,
 )
 teacher.eval()
 for p in teacher.parameters():
     p.requires_grad = False
-print("[DISTILL] Teacher loaded.")
+print("[DISTILL] Teacher loaded on GPU 0.")
 
-print("[DISTILL] Loading student BF16...")
+print("[DISTILL] Loading student BF16 on GPUs 2-3...")
 student = AutoModelForCausalLM.from_pretrained(
-    STUDENT_PATH, device_map="auto", torch_dtype=torch.bfloat16,
+    STUDENT_PATH, device_map={"": 1}, torch_dtype=torch.bfloat16,
 )
-print("[DISTILL] Student loaded.")
+print("[DISTILL] Student loaded on GPU 1.")
 
 print("[DISTILL] Applying LoRA r=64...")
 lora = LoraConfig(
@@ -104,7 +107,8 @@ class DistillTrainer(Trainer):
         sl=s_logits[...,:-1,:].contiguous(); ll=labels[...,1:].contiguous()
         ce=F.cross_entropy(sl.view(-1,sl.size(-1)), ll.view(-1), ignore_index=tok.pad_token_id)
         with torch.no_grad():
-            t_logits=teacher(input_ids=iids, attention_mask=mask).logits
+            t_device = next(teacher.parameters()).device
+            t_logits=teacher(input_ids=iids.to(t_device), attention_mask=mask.to(t_device)).logits.to(iids.device)
         T=TEMPERATURE
         slp=F.log_softmax(sl/T, dim=-1)
         tp=F.softmax(t_logits[...,:-1,:].contiguous()/T, dim=-1)
